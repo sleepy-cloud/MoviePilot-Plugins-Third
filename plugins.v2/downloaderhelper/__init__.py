@@ -36,7 +36,7 @@ class DownloaderHelper(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/hotlcc/MoviePilot-Plugins-Third/main/icons/DownloaderHelper.png"
     # 插件版本
-    plugin_version = "4.0.9"
+    plugin_version = "4.1.0"
     # 插件作者
     plugin_author = "hotlcc"
     # 作者主页
@@ -1679,10 +1679,15 @@ class DownloaderHelper(_PluginBase):
         """
         if not torrent or not source_file_info:
             return False, None
+        # 种子的真实数据路径：优先 content_path，缺失时用 save_path + 种子名拼
+        torrent_data_path = torrent.get('content_path')
+        if not torrent_data_path and torrent.get('save_path') and torrent.get('name'):
+            torrent_data_path = os.path.join(torrent.get('save_path'), torrent.get('name'))
         return self.__check_torrent_match_file(torrent_hash=torrent.get('hash'),
                                                torrent_data_file_name=torrent.get('name'),
                                                source_hash=None,
-                                               source_file_path=source_file_info.get('src'))
+                                               source_file_path=source_file_info.get('src'),
+                                               torrent_data_path=torrent_data_path)
 
     def __check_torrent_match_file_for_transmission(self, torrent: Torrent,
                                                     source_file_info: dict) -> Tuple[bool, Optional[str]]:
@@ -1694,22 +1699,35 @@ class DownloaderHelper(_PluginBase):
         """
         if not torrent or not source_file_info:
             return False, None
+        # 种子的真实数据路径：downloadDir + 种子名
+        download_dir = getattr(torrent, 'download_dir', None)
+        if not download_dir:
+            try:
+                download_dir = torrent.get('downloadDir')
+            except Exception:
+                download_dir = None
+        torrent_data_path = os.path.join(download_dir, torrent.name) \
+            if download_dir and getattr(torrent, 'name', None) else None
         return self.__check_torrent_match_file(torrent_hash=torrent.hashString,
                                                torrent_data_file_name=torrent.get('name'),
                                                source_hash=None,
-                                               source_file_path=source_file_info.get('src'))
+                                               source_file_path=source_file_info.get('src'),
+                                               torrent_data_path=torrent_data_path)
 
     def __check_torrent_match_file(self, torrent_hash: str,
                                    torrent_data_file_name: str,
                                    source_hash: Optional[str],
-                                   source_file_path: str) -> Tuple[bool, Optional[str]]:
+                                   source_file_path: str,
+                                   torrent_data_path: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """
         检查种子和源文件是否匹配
         :param torrent_hash: 种子hash
         :param torrent_data_file_name: 种子数据文件名
         :param source_hash: 源文件对应的种子hash
         :param source_file_path: 源文件路径
-        :return: 是否匹配, 匹配的种子数据文件（在MoviePilot中的）路径
+        :param torrent_data_path: 种子真实数据路径（下载器中的 content_path 等），
+                                  提供时以路径归属为准，不再仅凭名称匹配
+        :return: 是否匹配, 匹配的种子数据文件路径
         """
         if not torrent_hash or not torrent_data_file_name or not source_file_path:
             return False, None
@@ -1717,22 +1735,26 @@ class DownloaderHelper(_PluginBase):
         if source_hash and torrent_hash != hash:
             return False, None
 
-        # 从源文件路径中分离文件夹路径和文件名称
-        source_file_dir, source_file_name = os.path.split(source_file_path)
-        # 情况一：如果源文件名称和种子数据文件（夹）名称一致，则认为匹配，适用于单文件种子和原盘资源的情况
-        if source_file_name == torrent_data_file_name:
-            return True, source_file_path
-        # 情况二：如果原文件父目录名称和种子数据文件（夹）名称一致，则认为匹配，适用于多文件剧集种子的情况
-        _, source_file_dir_name = os.path.split(source_file_dir)
-        if source_file_dir_name == torrent_data_file_name:
-            return True, source_file_dir
-        # 情况三：如果种子数据文件（夹）名称是源文件路径的一部分，则认为匹配
-        torrent_data_file_name_wrap = os.path.sep + torrent_data_file_name + os.path.sep
-        index = source_file_path.find(torrent_data_file_name_wrap)
-        if index >= 0:
-            return True, source_file_path[0:index] + os.path.sep + torrent_data_file_name
-
-        return False, None
+        if torrent_data_path:
+            # 以种子真实数据路径校验事件路径的归属：
+            # 事件路径必须就是种子数据路径、位于其内（删了种子内的文件），
+            # 或是其上级路径（删了包含种子数据的目录），才认为与该种子相关；
+            # 名称相同但路径无关（如 strm 影子目录、媒体库硬链接副本）不构成归属，
+            # 不得据此删种，更不得带文件删种。存在性判断也改在真实数据路径上做。
+            real_path = os.path.normpath(torrent_data_path)
+            event_path = os.path.normpath(source_file_path)
+            if event_path == real_path \
+                    or event_path.startswith(real_path + os.path.sep) \
+                    or real_path.startswith(event_path + os.path.sep):
+                return True, real_path
+            logger.warn(f"源文件删除事件路径与种子真实数据路径无关，忽略该种子："
+                        f"种子={torrent_data_file_name}，事件路径={source_file_path}，数据路径={torrent_data_path}")
+            return False, None
+        else:
+            # 无法取得种子真实数据路径时无法验证归属，保守处理：不匹配，
+            # 避免重蹈仅凭名称匹配就带文件删种的覆辙
+            logger.warn(f"无法取得种子真实数据路径，忽略源文件删除事件匹配：种子={torrent_data_file_name}")
+            return False, None
 
     def __check_torrent_match_torrent_info(self,
                                            torrent_hash: str,
