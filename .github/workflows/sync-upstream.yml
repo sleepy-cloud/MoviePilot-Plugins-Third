@@ -3,12 +3,14 @@ name: Sync Upstream
 # 自动同步上游 hotlcc/MoviePilot-Plugins-Third 的更新到本 fork。
 # 策略：fetch upstream -> 把本 fork 的自有提交 rebase 到 upstream/main 之上 -> force-with-lease 推送。
 #   - 历史保持线性，不产生 "Merge ..." 同步提交；
-#     本 fork 相对 upstream 永远只多自己的提交（当前仅 1 个：DownloaderHelper 4.1.0 路径归属修复）。
+#     本 fork 相对 upstream 永远只多自己的提交（当前仅 1 个：DownloaderHelper 路径归属修复，版本 4.0.9.1）。
 #   - 干净 rebase：自动 force-with-lease push 到 main。
 #   - 有冲突：推送 sync-upstream 分支（= upstream/main），并用 SYNC_TOKEN(PAT) 自动开 PR 供人工解决；
 #             合并该 PR 时请选 "Rebase and merge"，避免重新引入 Merge 提交。
 #     注：上游频繁更新 DownloaderHelper 且同样会 bump 版本号，package.v2.json 与
-#         plugin_version 处是预期的冲突高发点，届时在 PR 里保留上游新版本号并顺延本修复的版本号。
+#         plugin_version 处是预期的冲突高发点。本 fork 的版本号规则是「上游基线+修订号」
+#         （如上游 4.0.9 -> 本 fork 4.0.9.1，修订号纯数字递增），解决冲突时基线跟随
+#         上游新版本、修订号从 .1 重计，不要让版本号与上游重合。
 #
 # 必须配置 SYNC_TOKEN，否则同步可能在 push 阶段失败：
 #   默认 GITHUB_TOKEN 是 GitHub App 身份，没有 workflows 权限；
@@ -100,7 +102,7 @@ jobs:
               '此 PR 由 `Sync Upstream` workflow 自动创建/刷新，用于把上游更新合入 `main`。' \
               '' \
               '- 本 fork 的自有提交与上游改动产生了**需要手动解决的冲突**（高发点：`package.v2.json` 与 DownloaderHelper 的 `plugin_version`，双方都会 bump 版本号）。' \
-              '- 解决冲突时请保留上游的新版本号，并把本 fork 修复的版本号顺延到其之后。' \
+              '- 解决冲突时版本号按「上游新基线+修订号」重编（如上游升到 4.1.0 则本 fork 用 4.1.0.1，修订号纯数字），不要与上游版本号重合。' \
               '- 合并时请选 **Rebase and merge**，不要用普通 Merge，以免重新引入 Merge 提交、破坏线性历史。' \
               '- 合并后下一次定时检查将回到「干净自动同步」状态。' \
               > /tmp/pr-body.md
