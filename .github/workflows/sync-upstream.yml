@@ -1,0 +1,123 @@
+name: Sync Upstream
+
+# 自动同步上游 hotlcc/MoviePilot-Plugins-Third 的更新到本 fork。
+# 策略：fetch upstream -> 把本 fork 的自有提交 rebase 到 upstream/main 之上 -> force-with-lease 推送。
+#   - 历史保持线性，不产生 "Merge ..." 同步提交；
+#     本 fork 相对 upstream 永远只多自己的提交（当前仅 1 个：DownloaderHelper 4.1.0 路径归属修复）。
+#   - 干净 rebase：自动 force-with-lease push 到 main。
+#   - 有冲突：推送 sync-upstream 分支（= upstream/main），并用 SYNC_TOKEN(PAT) 自动开 PR 供人工解决；
+#             合并该 PR 时请选 "Rebase and merge"，避免重新引入 Merge 提交。
+#     注：上游频繁更新 DownloaderHelper 且同样会 bump 版本号，package.v2.json 与
+#         plugin_version 处是预期的冲突高发点，届时在 PR 里保留上游新版本号并顺延本修复的版本号。
+#
+# 必须配置 SYNC_TOKEN，否则同步可能在 push 阶段失败：
+#   默认 GITHUB_TOKEN 是 GitHub App 身份，没有 workflows 权限；
+#   只要上游改动包含 .github/workflows/ 下的文件（如 release.yml），push 就会被远程拒绝：
+#     "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission"
+#
+# 配置方法：PAT 需包含本仓库（细粒度 PAT：仅选本仓库，Contents 读写 + Workflows 读写 +
+#   Pull requests 读写；若与 MoviePilot-Plugins 共用同一个细粒度 PAT，先在该 PAT 的
+#   Repository access 里把本仓库加进去），再到仓库 Settings > Secrets and variables >
+#   Actions 添加 SYNC_TOKEN=<该 PAT>
+
+on:
+  schedule:
+    # UTC 16:47 ≈ 北京时间 00:47，每天一次（与 MoviePilot-Plugins 的 00:17 错开）
+    - cron: '47 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 关键：让 checkout 持久化的推送凭据用 PAT，而不是默认 GITHUB_TOKEN。
+          # 只把 PAT 给 gh CLI 的话，git push 仍走 GITHUB_TOKEN，照样会被 workflows 权限拒绝。
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/hotlcc/MoviePilot-Plugins-Third.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date, nothing to sync."
+          else
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream has new commits."
+          fi
+
+      - name: Sync (rebase or open sync PR)
+        if: steps.check.outputs.has_updates == 'true'
+        env:
+          # 优先用 PAT；未配置 SYNC_TOKEN 时回退到 GITHUB_TOKEN
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          HAS_PAT: ${{ secrets.SYNC_TOKEN != '' }}
+        run: |
+          set -uo pipefail
+
+          # 提前把最常见的失败讲清楚：上游动了 workflow 文件且没配 PAT，push 注定被拒。
+          if [ "$HAS_PAT" != "true" ] && ! git diff --quiet HEAD upstream/main -- .github/workflows; then
+            echo "::error::上游本次更新包含 .github/workflows 的改动，但未配置 SYNC_TOKEN(PAT)：默认 GITHUB_TOKEN 无 workflows 权限，push 必被拒绝。请先按本文件头部说明添加 SYNC_TOKEN 后重跑。"
+            exit 1
+          fi
+
+          if git rebase upstream/main; then
+            echo "✅ Clean rebase — pushing to main (force-with-lease)."
+            git push --force-with-lease origin main
+            echo "::notice::Synced upstream to main successfully (linear history, no merge commits)."
+            exit 0
+          fi
+
+          echo "⚠️ Rebase conflicts — pushing sync-upstream branch for manual resolution."
+          git rebase --abort
+
+          SYNC_BRANCH="sync-upstream"
+          git checkout -B "$SYNC_BRANCH" upstream/main
+          git push --force origin "$SYNC_BRANCH"
+
+          if [ "$HAS_PAT" = "true" ]; then
+            printf '%s\n' \
+              '## ⬆️ 同步上游 hotlcc/MoviePilot-Plugins-Third' \
+              '' \
+              '此 PR 由 `Sync Upstream` workflow 自动创建/刷新，用于把上游更新合入 `main`。' \
+              '' \
+              '- 本 fork 的自有提交与上游改动产生了**需要手动解决的冲突**（高发点：`package.v2.json` 与 DownloaderHelper 的 `plugin_version`，双方都会 bump 版本号）。' \
+              '- 解决冲突时请保留上游的新版本号，并把本 fork 修复的版本号顺延到其之后。' \
+              '- 合并时请选 **Rebase and merge**，不要用普通 Merge，以免重新引入 Merge 提交、破坏线性历史。' \
+              '- 合并后下一次定时检查将回到「干净自动同步」状态。' \
+              > /tmp/pr-body.md
+
+            existing_pr="$(gh pr list --base main --head "$SYNC_BRANCH" --state open --json number -q '.[0].number // empty' 2>/dev/null || true)"
+
+            if [ -n "$existing_pr" ]; then
+              gh pr edit "$existing_pr" --body-file /tmp/pr-body.md
+              gh pr comment "$existing_pr" --body "🔄 上游有新更新，冲突已刷新，请重新解决后合并。"
+              echo "::notice::Refreshed existing sync PR #$existing_pr."
+            else
+              gh pr create --base main --head "$SYNC_BRANCH" \
+                --title "⬆️ 同步上游 hotlcc/MoviePilot-Plugins-Third" \
+                --body-file /tmp/pr-body.md
+              echo "::notice::Created new sync PR for conflict resolution."
+            fi
+          else
+            echo "::error::检测到冲突并已推送 sync-upstream 分支，但默认 GITHUB_TOKEN 无法创建 PR。请任选其一：(1) 在仓库 Settings > Secrets > Actions 添加 SYNC_TOKEN(PAT) 后重跑以自动开 PR；(2) 手动打开 https://github.com/${GITHUB_REPOSITORY}/compare/main...sync-upstream 新建 PR 并解决冲突。"
+            exit 1
+          fi
